@@ -1,0 +1,134 @@
+Python
+import streamlit as st
+import sqlite3
+import pandas as pd
+import plotly.express as px
+import requests
+import threading
+import time
+from datetime import datetime
+
+DB_NAME = "polymarket_analytics.db"
+GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+
+# ==========================================
+# 1. БЭКЕНД: СБОР ДАННЫХ И БАЗА ДАННЫХ
+# ==========================================
+def init_db():
+    """Создание таблицы, если её еще нет в облаке"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS price_history (
+            market_id TEXT, title TEXT, slug TEXT, price REAL, end_date TEXT, fetched_at TEXT
+        )
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_fetched_at ON price_history(fetched_at)')
+    conn.commit()
+    conn.close()
+
+def fetch_and_save_data():
+    """Фоновый сборщик для Polymarket Crypto 15M"""
+    params = {"closed": "false", "limit": 100, "tag_id": 100518}
+    while True:
+        try:
+            response = requests.get(GAMMA_API_URL, params=params, timeout=10)
+            if response.status_code == 200:
+                markets = response.json()
+                current_time = datetime.utcnow().isoformat()
+                data_to_save = []
+                
+                for market in markets:
+                    title = market.get("title", "")
+                    slug = market.get("slug", "")
+                    
+                    # Фильтр 15-минутных рынков
+                    if "15-Minute" in title or "15m" in slug.lower():
+                        prices = market.get("outcomePrices")
+                        price = float(prices[0]) if prices else None
+                        if price is not None:
+                            data_to_save.append((
+                                market.get("id"), title, slug, price, market.get("endDate"), current_time
+                            ))
+                
+                if data_to_save:
+                    conn = sqlite3.connect(DB_NAME)
+                    cursor = conn.cursor()
+                    cursor.executemany('INSERT INTO price_history VALUES (?,?,?,?,?,?)', data_to_save)
+                    conn.commit()
+                    conn.close()
+        except Exception:
+            pass # Облако может временно терять сеть, игнорируем микро-сбои
+        time.sleep(25) # Интервал запросов
+
+# Запуск фонового процесса один раз при старте сервера
+if "backend_running" not in st.session_state:
+    init_db()
+    st.session_state["backend_running"] = True
+    threading.Thread(target=fetch_and_save_data, daemon=True).start()
+
+
+# ==========================================
+# 2. ФРОНТЕНД: ИНТЕРФЕЙС STREAMLIT
+# ==========================================
+st.set_page_config(page_title="Polymarket Crypto 15M", layout="wide")
+st.title("📊 Мониторинг 15-минутных рынков Polymarket")
+
+def load_data_from_db():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        # Читаем данные за последние 2 часа
+        df = pd.read_sql_query(
+            "SELECT title, price, fetched_at FROM price_history WHERE fetched_at >= datetime('now', '-2 hours')", 
+            conn
+        )
+        conn.close()
+        if not df.empty:
+            df['fetched_at'] = pd.to_datetime(df['fetched_at'])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+df = load_data_from_db()
+
+if df.empty:
+    st.info("⏳ Инициализация базы данных в облаке. Подождите 15-20 секунд, пока сборщик скачает первые данные, и обновите страницу.")
+    if st.button("🔄 Обновить страницу"):
+        st.rerun()
+else:
+    # Анализ изменения цен (Delta)
+    grouped = df.sort_values('fetched_at').groupby('title')
+    stats = grouped.agg(
+        initial_price=('price', 'first'), 
+        current_price=('price', 'last'),
+        points_count=('price', 'count')
+    ).reset_index()
+    stats['delta'] = stats['current_price'] - stats['initial_price']
+    
+    if st.button("🔄 Обновить данные таблицы"):
+        st.rerun()
+
+    st.subheader("📈 Рейтинг изменения цен (Delta)")
+    st.dataframe(
+        stats.sort_values(by='delta', ascending=False), 
+        column_config={
+            "title": "Рынок", "initial_price": "Старт", "current_price": "Текущая", 
+            "points_count": "Точек", "delta": st.column_config.NumberColumn("Дельта", format="%+.2f")
+        },
+        hide_index=True, 
+        use_container_width=True
+    )
+
+    st.markdown("---")
+    
+    # Интерактивный график для выбранного рынка
+    selected_market = st.selectbox("🎯 Выберите конкретный рынок для просмотра графика:", stats['title'].unique())
+    if selected_market:
+        market_history = df[df['title'] == selected_market].sort_values('fetched_at')
+        fig = px.line(
+            market_history, x='fetched_at', y='price', 
+            title=f"История изменения цены YES для: {selected_market}", 
+            markers=True
+        )
+        fig.update_yaxes(range=[0, 1])
+        st.plotly_chart(fig, use_container_width=True)
